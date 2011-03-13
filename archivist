@@ -1,0 +1,422 @@
+#!/bin/bash
+
+set -e
+
+version="0.1"
+
+VDEBUG=5
+DEBUG=4
+INFO=3
+WARN=2
+ERROR=1
+FATAL=0
+verbosity=$INFO
+logFile=""
+
+log()
+{
+    msg=$1
+    [ $# -gt 1 ] && level=$2 || level=$INFO
+    [ $level -gt $verbosity ] && return
+
+    case $level in
+    $VDEBUG) msg="VDBG: $msg";;
+    $DEBUG)  msg="DBG: $msg";;
+    $INFO)   msg="INFO: $msg";;
+    $WARN)   msg="WARN: $msg";;
+    $ERROR)  msg="ERROR: $msg";;
+    $FATAL)  msg="FATAL: $msg";;
+    esac
+
+    msg="`date +%H:%M:%S` $msg"
+
+    [ ! -z "$logFile" ] && echo "$msg" >>$logFile
+    [ $level -le $WARN ] && echo "$msg" >&2 || echo "$msg"
+    [ $level -eq $FATAL ] && exit 1
+	return 0
+}
+
+printUsage()
+{
+    echo "Usage: $0 <options> repoName sourceDir destDir
+
+Where options is any of:
+  -h    Display this message
+  -v    Increase verbosity
+  
+repoName is the name of the repository to generate
+sourceDir contains a subdirectory for each package containing it's PKGBUILD
+destDir is where the repository is outputted"
+}
+
+sourcePkgBuild()
+{
+    pkgBuild=$1
+
+    pkgname=()
+    provides=()
+    depends=()
+    makedepends=()
+    optdepends=()
+
+    source $pkgBuild
+    return 0
+}
+
+arrayIndex()
+{
+    needle=$1
+    shift;
+    idx=0
+
+    while [ $# -gt 0 ]; do
+        [ "$1" = "$needle" ] && echo "$idx" && return 0
+        shift
+        idx=$(($idx+1))
+    done
+
+    echo "-1"
+    return 1
+}
+
+loadPackages()
+{
+    log "Loading packages" $INFO
+
+    for pkgBuild in `find "$srcDir" -mindepth 1 -type f -name PKGBUILD`; do
+        pkgDir="`dirname $pkgBuild`"
+        sourcePkgBuild "$pkgBuild"
+        log "Processing $pkgname" $VDEBUG
+
+        for name in $pkgname $provides; do
+            if [ ! -z "${pkgNames[$name]}" ]; then
+                log "$name from $pkgDir is already provided by ${pkgDirs[${pkgNames[$name]}]}" $WARN
+                continue
+            fi
+            pkgNames[$name]=$pkgname
+        done
+        pkgDirs[$pkgname]=$pkgDir
+
+        pkgs[${#pkgs[@]}]=$pkgname
+    done
+
+    return 0
+}
+
+retryUmount()
+{
+    mount=$1
+    
+    while [ true ]; do
+        sudo umount $mount && break
+        log "Unmount $mount failed - retrying" $WARN
+        sleep 1
+    done
+
+    return 0
+}
+
+chrootDir="/tmp/archivist-chroot-$$"
+pkgCacheDir="$HOME/.archivist/pacman-cache"
+dlCacheDir="$HOME/.archivist/dl-cache"
+nativeArch=`uname -m`
+architectures="$nativeArch"
+[ "$nativeArch" = "x86_64" ] && architectures="$architectures i686"
+numCPUs=`grep -E '^processor' /proc/cpuinfo | wc -l`
+maxParallel=5
+
+while getopts ":hv" opt; do
+    case $opt in
+    *h) echo "Archivist v$version"; printUsage; exit 0;;
+    *v) verbosity=$(($verbosity+1));;
+    \?) echo "Invalid option -$OPTARG" >&2; printUsage >&2; exit 1;;
+    *) printUsage >&2; exit 1;;
+    esac
+done
+shift $(($OPTIND-1))
+
+if [ -e "/.inside-chroot" ]; then
+    logFile="/archivist-run.log"
+    log "Running inside chroot `uname -a`" $INFO
+
+    srcDir=/src
+    pkgDir=/pkg
+    dlCacheDir=/dl-cache
+    mkdir -p $srcDir $pkgDir $dlCacheDir
+
+    eval export `grep -E '^LOCALE=' /etc/rc.conf`
+    export LANG=$LOCALE
+    locale-gen
+
+    [ ! -e "/usr/src/linux-`uname -r`" ] && ln -s /usr/src/linux-* /usr/src/linux-`uname -r`
+
+    sed -i 's|^\[core\]|[archivist]\nServer = /pkg/\n\n[core]|' /etc/pacman.conf
+
+    sed -i 's|ftp::/usr/bin/wget|ftp::/bin/archivist-wget|' /etc/makepkg.conf
+    sed -i 's|http::/usr/bin/wget|http::/bin/archivist-wget|' /etc/makepkg.conf
+    sed -i 's|https::/usr/bin/wget|https::/bin/archivist-wget|' /etc/makepkg.conf
+
+    echo "#!/bin/sh
+destpos=\$((\$#-1))
+eval dest=\\\$\$destpos
+eval uri=\\\$\$#
+if [ \"\${uri:0:1}\" = \"/\" ]; then
+   cp -v \"\$uri\" \"\$dest\" && exit 0
+   exit 1
+fi
+cacheFile=/dl-cache/\`basename \"\$uri\"\`
+if [ ! -e \"\$cacheFile\" ]; then
+  wget \${@:1:\$((\$#-2))} \"\$cacheFile\" \"\$uri\" || rm -f \"\$cacheFile\"
+fi
+[ ! -e \"\$cacheFile\" ] && exit 1
+cp \"\$cacheFile\" \"\$dest\"" >/bin/archivist-wget
+    chmod +x /bin/archivist-wget
+
+    pacman -Sy
+
+    declare -a pkgs
+    declare -A pkgNames pkgDirs
+    loadPackages
+
+    log "Ready to build ${#pkgs[@]} packages" $INFO
+    echo "Archivist v$version" >/archivist.log
+    echo "  `uname -a`" >>/archivist.log
+    echo "  ${#pkgs[@]} packages to build" >>/archivist.log
+    echo "  $numCPUs CPUs, max. $maxParallel parallel" >>/archivist.log
+    echo "  Started at `date +%Y%m%d-%H:%M:%S`" >>/archivist.log
+    echo >>/archivist.log
+
+    buildPackage()
+    {
+        buildingFile=/archivist-building-$pkgName
+        touch "$buildingFile"
+
+        fail=0
+        makepkg -oc --asroot || log "Unable to clean $pkgName" $WARN
+
+        syncLog=archivist-sync.log
+        while [ true ]; do
+            makepkg -os --noconfirm --asroot >$syncLog 2>&1 && break
+            grep 'unable to lock database' $syncLog >/dev/null && sleep 10 && continue
+            log "Failed $pkgName due to sync error" $DEBUG
+            cat $syncLog
+            fail=1
+            break
+        done
+        rm -f $syncLog
+
+        conservativeFile=archivist-conservative
+
+        if [ $fail -eq 0 ]; then
+            rm -vrf src pkg
+            [ -e "$conservativeFile" ] && makeFlags="-j1" || makeFlags="-j$numCPUs"
+            MAKEFLAGS="$makeFlags" makepkg -cf --noconfirm --asroot || fail=1
+            [ $fail -eq 1 ] && touch $conservativeFile
+        fi
+        
+        if [ $fail -eq 1 ]; then
+            echo "  `date +%Y%m%d-%H:%M:%S` fail $pkgName" >>/archivist.log
+            rm -f "$buildingFile"
+            return 1
+        fi
+
+        for pkgFile in *.pkg.tar.*; do
+            mv "$pkgFile" "/pkg/"
+            pkgFile="/pkg/$pkgFile"
+            while [ true ]; do
+                [ ! -e "$pkgFile" ] && log "Package $pkgFile moved?" $FATAL
+                repo-add "/pkg/archivist.db.tar.gz" "$pkgFile" && break || sleep 1
+            done
+            while [ true ]; do
+                pacman -Syu --noconfirm && break || sleep 5
+            done
+            names=`pacman -Qip "$pkgFile" | grep -E '^Name' | awk '{$1=$2=""; print $0}'`
+            for provide in `pacman -Qip "$pkgFile" | grep -E '^Provides' | awk '{$1=$2=""; print $0}'`; do
+                names[${#names[@]}]=`echo $provide | sed 's|:<>=| |g' | awk '{print $1}'`
+            done
+            for name in ${names[@]}; do
+                log "$pkgFile provides $name" $DEBUG
+                pacman -Qi $name >/dev/null 2>&1 || continue
+                log "  which is installed - installing this package"
+                while [ true ]; do
+                    [ ! -e "$pkgFile" ] && log "Package $pkgFile moved?" $FATAL
+                    pacman --noconfirm -U "$pkgFile" && break || sleep 5
+                done
+            done
+        done
+
+        echo "  `date +%Y%m%d-%H:%M:%S` success $pkgName" >>/archivist.log
+        rm -f "$buildingFile"
+        return 0
+    }
+
+    export MAKEFLAGS="-j1"
+
+    pass=0
+    remaining="`find "$srcDir" -mindepth 1 -type f -name PKGBUILD | wc -l`"
+    while [ ! "$remaining" = "0" ]; do
+        pass=$(($pass+1))
+        log "Pass $pass - $remaining packages remaining"
+        echo "Pass $pass - $remaining packages remaining:" >>/archivist.log
+
+        for pkgName in ${pkgs[@]}; do
+            while [ `ls /archivist-building-* 2>/dev/null | wc -l` -ge $maxParallel ]; do
+                sleep 1
+            done
+
+            pkgDir=${pkgDirs[$pkgName]}
+            [ ! -e "$pkgDir" ] && log "skip $pkgName" $VDEBUG && continue
+            failLog="/fail-$pkgName.log"
+
+            (
+                log "Building package $pkgName"
+                cd "$pkgDir"
+                fail=0
+                buildPackage >$failLog 2>&1 || fail=1
+                
+                if [ $fail -eq 1 ]; then
+                    log "Failed to build $pkgName"
+                else
+                    log "Successfully built $pkgName"
+                    rm -rf "$pkgDir"
+                    rm -f "$failLog"
+                fi
+            ) &
+            sleep 1
+        done
+
+        log "Awaiting end of pass $pass" $DEBUG
+        wait
+        echo >>/archivist.log
+        nremaining="`find "$srcDir" -mindepth 1 -type f -name PKGBUILD | wc -l`"
+        [ "$remaining" = "$nremaining" ] && log "Built nothing on last pass, ending" && break
+        remaining="$nremaining"
+    done
+
+    echo "Finished at `date +%Y%m%d-%H:%M:%S`" >>/archivist.log
+    log "Finished successfully in chroot" $DEBUG
+    exit 0
+fi
+
+if [ $# -lt 2 ]; then
+    printUsage >&2
+    exit 1
+fi
+
+repoName=$1
+srcDir=$2
+destDir=$3
+removeSrcDir=0
+
+if [ "${srcDir:0:6}" = "git://" ]; then
+    tmpDir="/tmp/archivist-src-$$"
+    git clone "$srcDir" "$tmpDir" || log "Unable to clone git repo" $FATAL
+    srcDir="$tmpDir"
+    removeSrcDir=1
+
+    rm -rf "$srcDir/ubuntu-testing/"
+fi
+
+[ ! -d "$srcDir" ] && log "Unable to find source directory '$srcDir'" $FATAL
+
+log "Build repository '$repoName' for architectures '$architectures'" $INFO
+
+log "Copying host cached packages" $INFO
+mkdir -p "$pkgCacheDir"
+for cached in /var/cache/pacman/pkg/*; do
+    dest="$pkgCacheDir/`basename $cached`"
+    [ -e "$dest" ] && continue
+    cp $cached "$dest"
+done
+
+mkdir -p "$dlCacheDir"
+rm -f $dlCacheDir/*.db.tar.gz
+
+for file in `find "$dlCacheDir" "$pkgCacheDir" -empty`; do
+     log "Removing empty cached file $file" $WARN
+     rm -f "$file"
+done
+
+for architecture in $architectures; do
+    log "Setting up $architecture chroot environment at $chrootDir" $INFO
+    mkdir -p "$chrootDir/var/lib/pacman"
+    mkdir -p "$chrootDir/var/cache/pacman/pkg"
+    mkdir -p "$chrootDir/dl-cache"
+
+    log "Binding caches" $INFO
+    sudo mount -o bind "$pkgCacheDir" "$chrootDir/var/cache/pacman/pkg"
+    sudo chmod -R a+rw "$pkgCacheDir"
+    sudo mount -o bind "$dlCacheDir" "$chrootDir/dl-cache"
+    sudo chmod -R a+rw "$dlCacheDir"
+
+    log "Initial pacman run" $DEBUG
+    fakeroot pacman -r "$chrootDir" --cachedir "$pkgCacheDir" --arch $architecture -Sy
+    fakeroot pacman -r "$chrootDir" --cachedir "$pkgCacheDir" --arch $architecture --noconfirm --needed -S base base-devel
+
+    cp -av "$0" "$chrootDir/bin/archivist"
+    touch "$chrootDir/.inside-chroot"
+    cp -v "/etc/resolv.conf" "$chrootDir/etc/"
+    cp -v "/etc/pacman.d/mirrorlist" "$chrootDir/etc/pacman.d/"
+
+    if [ "$architecture" = "x86_64" ]; then
+        log "Enabling multilib" $DEBUG
+        mlLine=`grep -n '\[multilib\]' "$chrootDir/etc/pacman.conf" | tr ':' ' ' | awk '{print $1}'`
+        sed -i "${mlLine}s|^#||" "$chrootDir/etc/pacman.conf"
+        sed -i "$(($mlLine+1))s|^#||" "$chrootDir/etc/pacman.conf"
+    fi
+
+    log "Copying package sources into chroot" $INFO
+    mkdir -p "$chrootDir/src"
+    cp -ar $srcDir/* "$chrootDir/src/"
+
+    log "Binding system mounts" $INFO
+    mntPaths="/dev /proc /sys"
+    for mntPath in $mntPaths; do
+        sudo mount -o bind $mntPath "$chrootDir/$mntPath"
+    done
+
+    chrootCmd="chroot"
+    if [ "$nativeArch" = "x86_64" ]; then
+        [ "$architecture" = "i686" ] && chrootCmd="linux32 $chrootCmd"
+    fi
+
+    chrootFlags=""
+    [ $verbosity -gt $INFO ] && chrootFlags="$chrootFlags -v"
+    [ $verbosity -gt $DEBUG ] && chrootFlags="$chrootFlags -v"
+
+    log "Entering chroot via '$chrootCmd'" $INFO
+    sudo $chrootCmd "$chrootDir" "archivist" $chrootFlags && fail=0 || fail=1
+
+    for mntPath in $mntPaths; do
+        retryUmount "$chrootDir/$mntPath"
+    done
+    retryUmount "$chrootDir/var/cache/pacman/pkg"
+    retryUmount "$chrootDir/dl-cache"
+
+    [ $fail -ne 0 ] && log "Failed! chroot is at $chrootDir" $FATAL
+
+    mkdir -p "$destDir/$architecture"
+
+    if [ -e "$chrootDir/archivist.log" ]; then
+        cat "$chrootDir/archivist.log"
+        cp "$chrootDir/archivist.log" "$destDir/$architecture.log"
+    fi
+
+    if [ ! "`ls $chrootDir/pkg/*.pkg.tar.* 2>/dev/null | wc -l`" = "0" ]; then
+        cp $chrootDir/pkg/*.pkg.tar.* "$destDir/$architecture/"
+        repo-add "$destDir/$architecture/$repoName.db.tar.gz" $destDir/$architecture/*.pkg.tar.*
+    fi
+    if [ ! "`ls $chrootDir/fail-*.log 2>/dev/null | wc -l`" = "0" ]; then
+        cp $chrootDir/fail-*.log "$destDir/$architecture/"
+    fi
+
+    sudo rm -rf $chrootDir
+done
+
+if [ $removeSrcDir -eq 1 ]; then
+    rm -rf "$srcDir"
+fi
+
+sudo chmod -R a+rw "$pkgCacheDir"
+sudo chmod -R a+rw "$dlCacheDir"
+log "All done!" $INFO
