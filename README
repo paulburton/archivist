@@ -1,0 +1,44 @@
+archivist: An Arch Linux repository build tool
+   Author: Paul Burton <paulburton89@gmail.com>
+  License: GPLv3
+
+What is it?
+    archivist is a tool which builds a repository from a set of PKGBUILDs, and
+    does so within a chroot environment to prevent cluttering the build machine
+    with packages that aren't necessarily wanted.
+
+    It is quite 'stupid' and takes the brute force approach of attempting to
+    build all packages, then going back to the ones that failed (due to
+    previously unmet dependencies within the repository) until it reaches a
+    point where there are no more packages to build, or all the ones remaining
+    fail to build. It builds packages in parallel within each build pass, with
+    the aim of keeping the CPU busy at all times to minimise build time.
+
+    If you run archivist on an x86_64 machine, it will build both x86_64 and
+    i686 packages. Otherwise, it will build packages for the architecture of
+    the machine it's running on.
+
+    The first time archivist attempts to build a package, it will do so using
+    parallel make where the number of jobs is equal to the number of CPUs in
+    the machine. If the package fails to build then on the next attempt it
+    will fall back to sequential make to avoid any problems that a package
+    may have with parallel make.
+
+Usage:
+    ./archivist nameOfRepository /path/to/sources /path/to/dest
+
+    The source directory should contain subdirectories which in turn contain
+    PKGBUILDs.
+
+    The destination directory will contain the built packages under a
+    subdirectory corresponding to the architecture the packages are built for.
+
+    Once archivist is finished, you should have a repository in your destination
+    directory that you can add to pacman.conf with something like the following:
+
+        [nameOfRepository]
+        Server = /path/to/dest/$arch/
+
+    Alternatively, you can copy the generated repository elsewhere, upload to a
+    web server or generally place it anywhere pacman can access so long as you
+    adjust the server line as appropriate.
